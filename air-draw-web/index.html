@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Air Draw</title>
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:#0b0b0f; color:#fff; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 16px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    button, select { padding:10px 12px; border-radius:10px; border:1px solid #2a2a35; background:#15151d; color:#fff; }
+    button:hover { background:#1b1b26; cursor:pointer; }
+    button:disabled { opacity:0.6; cursor:not-allowed; }
+    .stage { position: relative; width: 100%; aspect-ratio: 16/9; background:#000; border-radius:16px; overflow:hidden; border:1px solid #2a2a35; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    .hint { opacity:0.85; font-size: 14px; margin-top: 10px; line-height: 1.35; }
+    .badge { font-size:12px; padding:6px 10px; border:1px solid #2a2a35; border-radius:999px; background:#12121a; }
+  </style>
+
+  <!-- MediaPipe Hands + helpers (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="row" style="justify-content:space-between;">
+      <h2 style="margin:0;">Air Draw ✋🎨</h2>
+      <span class="badge" id="modeBadge">Mode: —</span>
+    </div>
+
+    <div class="row" style="margin:12px 0 12px;">
+      <button id="startBtn">Start camera</button>
+      <button id="clearBtn">Clear</button>
+      <button id="saveBtn">Save PNG</button>
+
+      <label style="display:flex; gap:8px; align-items:center;">
+        Color
+        <select id="colorSel">
+          <option value="blue" selected>Blue</option>
+          <option value="green">Green</option>
+          <option value="red">Red</option>
+          <option value="yellow">Yellow</option>
+          <option value="white">White</option>
+        </select>
+      </label>
+
+      <label style="display:flex; gap:8px; align-items:center;">
+        Thickness
+        <select id="thickSel">
+          <option value="4">4</option>
+          <option value="6" selected>6</option>
+          <option value="8">8</option>
+          <option value="10">10</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <div class="hint">
+      <div><b>Draw:</b> index finger up, middle down (pointing).</div>
+      <div><b>Erase:</b> index + middle up (two fingers) — erases a circle under your fingertip.</div>
+      <div><b>Tip:</b> good lighting helps a lot.</div>
+    </div>
+  </div>
+
+<script>
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+
+  const startBtn = document.getElementById("startBtn");
+  const clearBtn = document.getElementById("clearBtn");
+  const saveBtn = document.getElementById("saveBtn");
+  const colorSel = document.getElementById("colorSel");
+  const thickSel = document.getElementById("thickSel");
+  const modeBadge = document.getElementById("modeBadge");
+
+  const COLORS = {
+    blue:   "rgb(40,120,255)",
+    green:  "rgb(0,220,120)",
+    red:    "rgb(255,80,80)",
+    yellow: "rgb(255,220,80)",
+    white:  "rgb(255,255,255)"
+  };
+
+  let drawingLayer;   // offscreen canvas to hold strokes
+  let dctx;
+  let prev = null;
+  let camera = null;
+  let started = false;
+
+  function resizeCanvases() {
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.floor(rect.width);
+    const h = Math.floor(rect.height);
+
+    canvas.width = w;
+    canvas.height = h;
+
+    if (!drawingLayer) {
+      drawingLayer = document.createElement("canvas");
+      dctx = drawingLayer.getContext("2d");
+    }
+    drawingLayer.width = w;
+    drawingLayer.height = h;
+  }
+
+  window.addEventListener("resize", resizeCanvases);
+  resizeCanvases();
+
+  function fingerUp(landmarks, tipIdx, pipIdx) {
+    // y grows downward. finger up => tip is higher (smaller y) than pip.
+    return landmarks[tipIdx].y < landmarks[pipIdx].y;
+  }
+
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.7
+  });
+
+  hands.onResults((results) => {
+    const w = canvas.width;
+    const h = canvas.height;
+
+    ctx.clearRect(0, 0, w, h);
+
+    // ---- Mirror the camera frame (so it feels like a mirror) ----
+    ctx.save();
+    ctx.scale(-1, 1);
+    ctx.drawImage(results.image, -w, 0, w, h);
+    ctx.restore();
+
+    let mode = "NO HAND";
+
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      const lm = results.multiHandLandmarks[0];
+
+      const indexUp = fingerUp(lm, 8, 6);
+      const middleUp = fingerUp(lm, 12, 10);
+
+      // IMPORTANT: mirror X coordinate to match mirrored video
+      const x = Math.round((1 - lm[8].x) * w);
+      const y = Math.round(lm[8].y * h);
+
+      // fingertip cursor
+      ctx.beginPath();
+      ctx.arc(x, y, 8, 0, Math.PI * 2);
+      ctx.fillStyle = COLORS[colorSel.value];
+      ctx.fill();
+
+      if (indexUp && !middleUp) {
+        mode = "DRAW";
+        const thickness = parseInt(thickSel.value, 10);
+        dctx.lineWidth = thickness;
+        dctx.lineCap = "round";
+        dctx.strokeStyle = COLORS[colorSel.value];
+
+        if (!prev) prev = {x, y};
+        dctx.beginPath();
+        dctx.moveTo(prev.x, prev.y);
+        dctx.lineTo(x, y);
+        dctx.stroke();
+        prev = {x, y};
+
+      } else if (indexUp && middleUp) {
+        mode = "ERASE";
+        const r = 26;
+        dctx.save();
+        dctx.globalCompositeOperation = "destination-out";
+        dctx.beginPath();
+        dctx.arc(x, y, r, 0, Math.PI * 2);
+        dctx.fill();
+        dctx.restore();
+        prev = null;
+
+      } else {
+        mode = "HOVER";
+        prev = null;
+      }
+    } else {
+      prev = null;
+    }
+
+    modeBadge.textContent = `Mode: ${mode}`;
+
+    // ---- Composite drawing layer (NOT mirrored again, because coords are already mirrored) ----
+    ctx.drawImage(drawingLayer, 0, 0, w, h);
+  });
+
+  async function start() {
+    if (started) return;
+    started = true;
+
+    camera = new Camera(video, {
+      onFrame: async () => {
+        await hands.send({ image: video });
+      },
+      width: 1280,
+      height: 720
+    });
+
+    await camera.start();
+  }
+
+  startBtn.addEventListener("click", async () => {
+    try {
+      await start();
+      startBtn.textContent = "Camera started";
+      startBtn.disabled = true;
+    } catch (e) {
+      alert("Camera failed to start. Allow camera permissions. Deployed (HTTPS) works best.");
+      console.error(e);
+    }
+  });
+
+  clearBtn.addEventListener("click", () => {
+    if (!dctx) return;
+    dctx.clearRect(0, 0, drawingLayer.width, drawingLayer.height);
+  });
+
+  saveBtn.addEventListener("click", () => {
+    const a = document.createElement("a");
+    a.download = "air-draw.png";
+    a.href = canvas.toDataURL("image/png");
+    a.click();
+  });
+</script>
+</body>
+</html>
